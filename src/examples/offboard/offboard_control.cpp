@@ -43,6 +43,8 @@
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_control_mode.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <px4_msgs/msg/vehicle_local_position.hpp>
+
 #include <stdint.h>
 
 #include <chrono>
@@ -52,24 +54,55 @@ using namespace std::chrono;
 using namespace std::chrono_literals;
 using namespace px4_msgs::msg;
 
+#define NOFDRONES 16
+
 class OffboardControl : public rclcpp::Node
 {
 public:
+	// std::string sel_ns = "";
+	float vel_received[NOFDRONES][3] = {{0.0, 0.0, 0.0}};
+	float loc_received[NOFDRONES][3] = {{0.0, 0.0, 0.0}};
 	OffboardControl() : Node("offboard_control")
 	{
+		// sel_ns = px4_ns;
+		rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
+		auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
+		
+		for (int i = 0; i < NOFDRONES; i++) {
+			// subscribe to every drones' local position/velocity data
+			subscription_[i] = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>(
+				"/px4_"+std::to_string(i+1)+"/fmu/out/vehicle_local_position", qos,
+			[this, i](const px4_msgs::msg::VehicleLocalPosition::UniquePtr msg) {
+				vel_received[i][0] = msg->vx;
+				vel_received[i][1] = msg->vy;
+				vel_received[i][2] = msg->vz;
+				loc_received[i][0] = msg->x;
+				loc_received[i][1] = msg->y;
+				loc_received[i][2] = msg->z;
+			}
+			);
+			
 
-		offboard_control_mode_publisher_ = this->create_publisher<OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
-		trajectory_setpoint_publisher_ = this->create_publisher<TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
-		vehicle_command_publisher_ = this->create_publisher<VehicleCommand>("/fmu/in/vehicle_command", 10);
-
+			// create publisher for every drones' offboard control mode, trajectory setpoint, and vehicle command
+			offboard_control_mode_publisher_[i] = this->create_publisher<OffboardControlMode>(
+				"/px4_"+std::to_string(i+1)+"/fmu/in/offboard_control_mode", 10);
+			trajectory_setpoint_publisher_[i] = this->create_publisher<TrajectorySetpoint>(
+				"/px4_"+std::to_string(i+1)+"/fmu/in/trajectory_setpoint", 10);
+			vehicle_command_publisher_[i] = this->create_publisher<VehicleCommand>(
+				"/px4_"+std::to_string(i+1)+"/fmu/in/vehicle_command", 10);
+		}
+		
 		offboard_setpoint_counter_ = 0;
 
 		auto timer_callback = [this]() -> void {
 
 			if (offboard_setpoint_counter_ == 10) {
 				// Change to Offboard mode after 10 setpoints
-				this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
-
+				for (int i = 0; i < NOFDRONES; i++)
+				{
+					this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6, 1+i);
+				}
+				
 				// Arm the vehicle
 				this->arm();
 			}
@@ -92,9 +125,10 @@ public:
 private:
 	rclcpp::TimerBase::SharedPtr timer_;
 
-	rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
-	rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
-	rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_;
+	rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr subscription_[NOFDRONES];
+	rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_[NOFDRONES];
+	rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_[NOFDRONES];
+	rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_[NOFDRONES];
 
 	std::atomic<uint64_t> timestamp_;   //!< common synced timestamped
 
@@ -102,7 +136,7 @@ private:
 
 	void publish_offboard_control_mode();
 	void publish_trajectory_setpoint();
-	void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
+	void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0, int target = 0);
 };
 
 /**
@@ -110,7 +144,12 @@ private:
  */
 void OffboardControl::arm()
 {
-	publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0);
+	for (int i = 0; i < NOFDRONES; i++)
+	{
+		publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0, 0.0, 1+i);
+		/* code */
+	}
+	
 
 	RCLCPP_INFO(this->get_logger(), "Arm command send");
 }
@@ -120,7 +159,10 @@ void OffboardControl::arm()
  */
 void OffboardControl::disarm()
 {
-	publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0);
+	for (int i = 0; i < NOFDRONES; i++)
+	{
+		publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0, 0.0, 1+i);
+	}
 
 	RCLCPP_INFO(this->get_logger(), "Disarm command send");
 }
@@ -132,13 +174,16 @@ void OffboardControl::disarm()
 void OffboardControl::publish_offboard_control_mode()
 {
 	OffboardControlMode msg{};
-	msg.position = true;
-	msg.velocity = false;
+	msg.position = nan;
+	msg.velocity = true;
 	msg.acceleration = false;
 	msg.attitude = false;
 	msg.body_rate = false;
 	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	offboard_control_mode_publisher_->publish(msg);
+	for (int i = 0; i < NOFDRONES; i++)
+	{
+		offboard_control_mode_publisher_[i]->publish(msg);
+	}
 }
 
 /**
@@ -148,11 +193,34 @@ void OffboardControl::publish_offboard_control_mode()
  */
 void OffboardControl::publish_trajectory_setpoint()
 {
+	RCLCPP_INFO(this->get_logger(), 
+		"\n\n\n\n\n1: [%f\t%f\t%f]\n2: [%f\t%f\t%f]\n3: [%f\t%f\t%f]\n4: [%f\t%f\t%f]\n\n\n\n", 
+		loc_received[0][0], loc_received[0][1], loc_received[0][2], 
+		loc_received[1][0], loc_received[1][1], loc_received[1][2], 
+		loc_received[2][0], loc_received[2][1], loc_received[2][2], 
+		loc_received[3][0], loc_received[3][1], loc_received[3][2]
+	);
+
+	
 	TrajectorySetpoint msg{};
-	msg.position = {0.0, 0.0, -5.0};
+	msg.velocity = {0.0, 0.0, -1.0};
 	msg.yaw = -3.14; // [-PI:PI]
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	trajectory_setpoint_publisher_->publish(msg);
+	uint64_t tstimestamp = this->get_clock()->now().nanoseconds() / 1000;
+	msg.timestamp = tstimestamp;
+	if (tstimestamp % 10000000 < 5000000) {
+		msg.velocity = {0.0, 1.0, -1.0};
+	} else {
+		msg.velocity = {1.0, 0.0,  -1.0};
+	}
+	for (int i = 0; i < NOFDRONES; i++){
+		trajectory_setpoint_publisher_[i]->publish(msg);
+	}
+	
+	/* // print next trajectory setpoint
+	RCLCPP_INFO(this->get_logger(), "Trajectory has been set to... {%f, %f, %f}", 
+		msg.position[0], msg.position[1], msg.position[2]); 
+	*/
+
 }
 
 /**
@@ -161,19 +229,19 @@ void OffboardControl::publish_trajectory_setpoint()
  * @param param1    Command parameter 1
  * @param param2    Command parameter 2
  */
-void OffboardControl::publish_vehicle_command(uint16_t command, float param1, float param2)
+void OffboardControl::publish_vehicle_command(uint16_t command, float param1, float param2, int target)
 {
 	VehicleCommand msg{};
 	msg.param1 = param1;
 	msg.param2 = param2;
 	msg.command = command;
-	msg.target_system = 1;
-	msg.target_component = 1;
-	msg.source_system = 1;
-	msg.source_component = 1;
+	msg.target_system = 0;
+	msg.target_component = 0;
+	msg.source_system = 2;
+	msg.source_component = 2;
 	msg.from_external = true;
 	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	vehicle_command_publisher_->publish(msg);
+	vehicle_command_publisher_[target-1]->publish(msg);
 }
 
 int main(int argc, char *argv[])
